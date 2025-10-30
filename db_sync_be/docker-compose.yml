@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # Master Database
+  master-db:
+    image: mysql:8.0
+    container_name: master-db
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: master_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - master-data:/var/lib/mysql
+      - ./classicmodels_master.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - sync-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Slave Database
+  slave-db:
+    image: mysql:8.0
+    container_name: slave-db
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: slave_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - slave-data:/var/lib/mysql
+      - ./init-backup.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - sync-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ppassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Sync Service
+  sync-service:
+    build: .
+    container_name: sync-service
+    environment:
+      PORT: 3000
+      MASTER_DB_HOST: master-db
+      MASTER_DB_PORT: 3306
+      MASTER_DB_USER: root
+      MASTER_DB_PASSWORD: password
+      MASTER_DB_NAME: master_db
+      BACKUP_DB_HOST: slave-db
+      BACKUP_DB_PORT: 3306
+      BACKUP_DB_USER: root
+      BACKUP_DB_PASSWORD: password
+      BACKUP_DB_NAME: slave_db
+    ports:
+      - "3000:3000"
+    depends_on:
+      master-db:
+        condition: service_healthy
+      slave-db:
+        condition: service_healthy
+    networks:
+      - sync-network
+    restart: unless-stopped
+
+volumes:
+  master-data:
+  backup-data:
+
+networks:
+  sync-network:
+    driver: bridge
