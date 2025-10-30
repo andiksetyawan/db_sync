@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # MySQL Master Database
+  mysql-master:
+    image: mysql:8.0
+    container_name: db-sync-mysql-master
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: master_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_master_data:/var/lib/mysql
+      - ./db_sync_be/init-master.sql:/docker-entrypoint-initdb.d/init-master.sql
+    networks:
+      - db-sync-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # MySQL Backup Database
+  mysql-backup:
+    image: mysql:8.0
+    container_name: db-sync-mysql-backup
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: backup_db
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_backup_data:/var/lib/mysql
+      - ./db_sync_be/init-backup.sql:/docker-entrypoint-initdb.d/init-backup.sql
+    networks:
+      - db-sync-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # Backend Service
+  backend:
+    build:
+      context: ./db_sync_be
+      dockerfile: Dockerfile
+    container_name: db-sync-backend
+    environment:
+      - SERVER_PORT=3000
+      - SYNC_SCHEDULE=*/1 * * * *
+      - SYNC_BATCH_SIZE=100
+      - SYNC_AUTO_SCHEMA_SYNC=true
+      - MASTER_DB_HOST=mysql-master
+      - MASTER_DB_PORT=3306
+      - MASTER_DB_USER=root
+      - MASTER_DB_PASSWORD=password
+      - MASTER_DB_NAME=master_db
+      - BACKUP_DB_HOST=mysql-backup
+      - BACKUP_DB_PORT=3306
+      - BACKUP_DB_USER=root
+      - BACKUP_DB_PASSWORD=password
+      - BACKUP_DB_NAME=backup_db
+    ports:
+      - "3000:3000"
+    depends_on:
+      mysql-master:
+        condition: service_healthy
+      mysql-backup:
+        condition: service_healthy
+    networks:
+      - db-sync-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend Service
+  frontend:
+    build:
+      context: ./db_sync_fe
+      dockerfile: Dockerfile
+    container_name: db-sync-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - db-sync-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  mysql_master_data:
+    driver: local
+  mysql_backup_data:
+    driver: local
+
+networks:
+  db-sync-network:
+    driver: bridge
