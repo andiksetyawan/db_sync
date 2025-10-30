@@ -305,8 +305,13 @@ func (s *SyncService) fetchDataFromMaster(tableName, pkColumn string, offset, li
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	query := fmt.Sprintf("SELECT * FROM `%s` WHERE `%s` > ? ORDER BY `%s` LIMIT ?",
-		tableName, pkColumn, pkColumn)
+	operator := ">"
+	if offset == 0 {
+		operator = ">="
+	}
+
+	query := fmt.Sprintf("SELECT * FROM `%s` WHERE `%s` %s ? ORDER BY `%s` LIMIT ?",
+		tableName, pkColumn, operator, pkColumn)
 
 	rows, err := s.masterDB.QueryContext(ctx, query, offset, limit)
 	if err != nil {
