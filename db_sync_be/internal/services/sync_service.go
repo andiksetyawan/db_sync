@@ -302,6 +302,39 @@ func (s *SyncService) getPrimaryKeyColumn(tableName string) (string, error) {
 	return pkColumn, nil
 }
 
+func (s *SyncService) getPrimaryKeyColumns(tableName string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := `SELECT COLUMN_NAME
+	          FROM information_schema.KEY_COLUMN_USAGE
+	          WHERE TABLE_SCHEMA = DATABASE()
+	          AND TABLE_NAME = ?
+	          AND CONSTRAINT_NAME = 'PRIMARY'
+	          ORDER BY ORDINAL_POSITION`
+
+	rows, err := s.masterDB.QueryContext(ctx, query, tableName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pkColumns []string
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, err
+		}
+		pkColumns = append(pkColumns, columnName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return pkColumns, nil
+}
+
 // hasUpdatedAtColumn mengecek apakah tabel punya kolom updated_at
 func (s *SyncService) hasUpdatedAtColumn(tableName string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -465,6 +498,12 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Get primary key columns for composite key support
+	pkColumns, err := s.getPrimaryKeyColumns(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get primary key columns: %w", err)
+	}
+
 	// Get table columns
 	columns, err := s.getTableColumns(tableName)
 	if err != nil {
@@ -478,10 +517,17 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	}
 	concatExpr := strings.Join(concatColumns, ", ")
 
+	// build PK columns for SELECT
+	var pkSelectColumns []string
+	for _, pk := range pkColumns {
+		pkSelectColumns = append(pkSelectColumns, fmt.Sprintf("`%s`", pk))
+	}
+	pkSelectExpr := strings.Join(pkSelectColumns, ", ")
+
 	// Get all master data with checksums
 	masterQuery := fmt.Sprintf(
-		"SELECT *, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
-		concatExpr, tableName, pkColumn)
+		"SELECT *, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY %s",
+		concatExpr, tableName, pkSelectExpr)
 
 	masterRows, err := s.masterDB.QueryContext(ctx, masterQuery)
 	if err != nil {
@@ -495,8 +541,8 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	}
 
 	backupQuery := fmt.Sprintf(
-		"SELECT `%s`, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
-		pkColumn, concatExpr, tableName, pkColumn)
+		"SELECT %s, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY %s",
+		pkSelectExpr, concatExpr, tableName, pkSelectExpr)
 
 	backupRows, err := s.backupDB.QueryContext(ctx, backupQuery)
 	if err != nil {
@@ -512,49 +558,85 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	}
 	defer backupRows.Close()
 
-	// Step 3: Build backup checksum map
+	// build backup checksum map using composite key
 	backupChecksums := make(map[string]string)
 	for backupRows.Next() {
-		var pkValue interface{}
-		var checksum string
+		// Prepare slice for scanning PK values + checksum
+		scanValues := make([]interface{}, len(pkColumns)+1)
+		scanPointers := make([]interface{}, len(pkColumns)+1)
+		for i := range scanValues {
+			scanPointers[i] = &scanValues[i]
+		}
 
-		// Scan PK and checksum
-		err := backupRows.Scan(&pkValue, &checksum)
+		err := backupRows.Scan(scanPointers...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan backup checksum: %w", err)
 		}
 
-		// Convert pkValue to string for map key
-		var pkStr string
-		if b, ok := pkValue.([]byte); ok {
-			pkStr = string(b)
-		} else {
-			pkStr = fmt.Sprintf("%v", pkValue)
+		// Build composite key from PK values
+		var keyParts []string
+		for i := 0; i < len(pkColumns); i++ {
+			pkValue := scanValues[i]
+			var pkStr string
+			if b, ok := pkValue.([]byte); ok {
+				pkStr = string(b)
+			} else {
+				pkStr = fmt.Sprintf("%v", pkValue)
+			}
+			keyParts = append(keyParts, pkStr)
 		}
-		backupChecksums[pkStr] = checksum
+		compositeKey := strings.Join(keyParts, "|")
+
+		// Last value is checksum - convert byte array to string
+		checksumValue := scanValues[len(pkColumns)]
+		var checksum string
+		if b, ok := checksumValue.([]byte); ok {
+			checksum = string(b)
+		} else {
+			checksum = fmt.Sprintf("%v", checksumValue)
+		}
+		backupChecksums[compositeKey] = checksum
 	}
 
 	var changedRows []map[string]interface{}
 	for _, masterRow := range masterData {
-		pkValue, exists := masterRow[pkColumn]
+		// Build composite key from master row
+		var keyParts []string
+		allPKExists := true
+		for _, pkCol := range pkColumns {
+			pkValue, exists := masterRow[pkCol]
+			if !exists {
+				allPKExists = false
+				break
+			}
+			var pkStr string
+			if b, ok := pkValue.([]byte); ok {
+				pkStr = string(b)
+			} else {
+				pkStr = fmt.Sprintf("%v", pkValue)
+			}
+			keyParts = append(keyParts, pkStr)
+		}
+
+		if !allPKExists {
+			continue
+		}
+
+		masterChecksumValue, exists := masterRow["row_checksum"]
 		if !exists {
 			continue
 		}
 
-		masterChecksum, exists := masterRow["row_checksum"]
-		if !exists {
-			continue
-		}
-
-		// Convert pkValue to string for map lookup
-		var pkStr string
-		if b, ok := pkValue.([]byte); ok {
-			pkStr = string(b)
+		// Convert master checksum to string
+		var masterChecksum string
+		if b, ok := masterChecksumValue.([]byte); ok {
+			masterChecksum = string(b)
 		} else {
-			pkStr = fmt.Sprintf("%v", pkValue)
+			masterChecksum = fmt.Sprintf("%v", masterChecksumValue)
 		}
 
-		backupChecksum, exists := backupChecksums[pkStr]
+		compositeKey := strings.Join(keyParts, "|")
+		backupChecksum, exists := backupChecksums[compositeKey]
 
 		// If row doesn't exist in backup OR checksums are different
 		if !exists || masterChecksum != backupChecksum {
