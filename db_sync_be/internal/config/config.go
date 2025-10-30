@@ -17,6 +17,8 @@ type SyncConfig struct {
 	BatchSize int `env:"BATCH_SIZE" envDefault:"100"`
 
 	AutoSchemaSync bool `env:"AUTO_SCHEMA_SYNC" envDefault:"true"`
+
+	EnableChecksumSync bool `env:"ENABLE_CHECKSUM_SYNC" envDefault:"true"`
 }
 
 type DatabaseConfig struct {

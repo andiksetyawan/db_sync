@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"database/sql"
+	"db-sync-scheduler/internal/config"
 	"db-sync-scheduler/internal/models"
 	"fmt"
 	"log"
@@ -26,10 +27,11 @@ type SyncService struct {
 	syncSchema    bool
 	lastRunTime   time.Time
 	nextRunTime   time.Time
+	config        *config.AppConfig
 }
 
 // NewSyncService creates a new sync service
-func NewSyncService(masterDB, backupDB *sql.DB, schemaService *SchemaService, cronSchedule string, batchSize int, autoSchemaSync bool) *SyncService {
+func NewSyncService(masterDB, backupDB *sql.DB, schemaService *SchemaService, cronSchedule string, batchSize int, autoSchemaSync bool, cfg *config.AppConfig) *SyncService {
 	return &SyncService{
 		masterDB:      masterDB,
 		backupDB:      backupDB,
@@ -40,6 +42,7 @@ func NewSyncService(masterDB, backupDB *sql.DB, schemaService *SchemaService, cr
 		tableStatus:   make(map[string]*models.SyncStatus),
 		schemaService: schemaService,
 		syncSchema:    autoSchemaSync,
+		config:        cfg,
 	}
 }
 
@@ -237,7 +240,7 @@ func (s *SyncService) syncTable(tableName string) {
 		}
 	}
 
-	// STEP 2: Sync updated data (by updated_at timestamp)
+	// STEP 2: Sync updated data (by updated_at timestamp or checksum)
 	if hasUpdatedAt && !lastSyncTime.IsZero() {
 		log.Printf("  Checking for updated records since %s", lastSyncTime.Format("2006-01-02 15:04:05"))
 
@@ -253,6 +256,25 @@ func (s *SyncService) syncTable(tableName string) {
 				log.Printf("  Updated data: %d records synced", synced)
 			}
 		}
+	} else if s.config.Sync.EnableChecksumSync {
+		log.Printf("performing checksum-based sync for changed records")
+
+		changedRows, err := s.fetchChangedDataByChecksum(tableName, pkColumn)
+		if err != nil {
+			log.Printf("error fetching changed data from %s: %v", tableName, err)
+		} else if len(changedRows) > 0 {
+			synced, _, err := s.upsertDataToBackup(tableName, pkColumn, changedRows)
+			if err != nil {
+				log.Printf("error upserting changed data to %s: %v", tableName, err)
+			} else {
+				totalSynced += synced
+				log.Printf("changed data: %d records synced", synced)
+			}
+		} else {
+			log.Printf("No changed records found")
+		}
+	} else {
+		log.Printf("Checksum sync disabled, skipping update detection for table without updated_at")
 	}
 
 	s.updateTableStatus(tableName, "success", "", currentOffset, totalSynced)
@@ -397,6 +419,160 @@ func (s *SyncService) fetchUpdatedDataFromMaster(tableName, pkColumn string, las
 		for i, col := range columns {
 			val := values[i]
 			// Convert []byte to string
+			if b, ok := val.([]byte); ok {
+				rowMap[col] = string(b)
+			} else {
+				rowMap[col] = val
+			}
+		}
+
+		results = append(results, rowMap)
+	}
+
+	return results, rows.Err()
+}
+
+// getTableColumns retrieves all column names for a table
+func (s *SyncService) getTableColumns(tableName string) ([]string, error) {
+	query := `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+			  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? 
+			  ORDER BY ORDINAL_POSITION`
+
+	rows, err := s.masterDB.Query(query, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get columns for table %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var columns []string
+	for rows.Next() {
+		var columnName string
+		if err := rows.Scan(&columnName); err != nil {
+			return nil, fmt.Errorf("failed to scan column name: %w", err)
+		}
+		columns = append(columns, columnName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating columns: %w", err)
+	}
+
+	return columns, nil
+}
+
+// fetchChangedDataByChecksum membandingkan checksum data antara master dan backup untuk mendeteksi perubahan
+func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]map[string]interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Get table columns
+	columns, err := s.getTableColumns(tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get table columns: %w", err)
+	}
+
+	// Build CONCAT_WS expression with COALESCE for NULL handling
+	var concatColumns []string
+	for _, col := range columns {
+		concatColumns = append(concatColumns, fmt.Sprintf("COALESCE(`%s`, '')", col))
+	}
+	concatExpr := strings.Join(concatColumns, ", ")
+
+	// Get all records from master with their checksums
+	masterQuery := fmt.Sprintf("SELECT *, CRC32(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
+		concatExpr, tableName, pkColumn)
+
+	masterRows, err := s.masterDB.QueryContext(ctx, masterQuery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query master data: %w", err)
+	}
+	defer masterRows.Close()
+
+	masterData, err := s.scanRowsToMaps(masterRows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan master rows: %w", err)
+	}
+
+	// Get all records from backup with their checksums
+	backupQuery := fmt.Sprintf("SELECT *, CRC32(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
+		concatExpr, tableName, pkColumn)
+
+	backupRows, err := s.backupDB.QueryContext(ctx, backupQuery)
+	if err != nil {
+		if strings.Contains(err.Error(), "doesn't exist") {
+			for i := range masterData {
+				delete(masterData[i], "row_checksum")
+			}
+			return masterData, nil
+		}
+		return nil, fmt.Errorf("failed to query backup data: %w", err)
+	}
+	defer backupRows.Close()
+
+	backupData, err := s.scanRowsToMaps(backupRows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan backup rows: %w", err)
+	}
+
+	backupChecksums := make(map[interface{}]interface{})
+	for _, row := range backupData {
+		if pkValue, exists := row[pkColumn]; exists {
+			if checksum, exists := row["row_checksum"]; exists {
+				backupChecksums[pkValue] = checksum
+			}
+		}
+	}
+
+	var changedRows []map[string]interface{}
+	for _, masterRow := range masterData {
+		pkValue, exists := masterRow[pkColumn]
+		if !exists {
+			continue
+		}
+
+		masterChecksum, exists := masterRow["row_checksum"]
+		if !exists {
+			continue
+		}
+
+		backupChecksum, exists := backupChecksums[pkValue]
+
+		if !exists || backupChecksum != masterChecksum {
+			rowCopy := make(map[string]interface{})
+			for k, v := range masterRow {
+				if k != "row_checksum" {
+					rowCopy[k] = v
+				}
+			}
+			changedRows = append(changedRows, rowCopy)
+		}
+	}
+
+	return changedRows, nil
+}
+
+func (s *SyncService) scanRowsToMaps(rows *sql.Rows) ([]map[string]interface{}, error) {
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []map[string]interface{}
+
+	for rows.Next() {
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+
+		rowMap := make(map[string]interface{})
+		for i, col := range columns {
+			val := values[i]
 			if b, ok := val.([]byte); ok {
 				rowMap[col] = string(b)
 			} else {

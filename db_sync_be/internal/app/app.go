@@ -29,6 +29,7 @@ func NewApplication(cfg *config.AppConfig, masterDB, backupDB *sql.DB) *Applicat
 		cfg.Sync.Schedule,
 		cfg.Sync.BatchSize,
 		cfg.Sync.AutoSchemaSync,
+		cfg,
 	)
 
 	return app
