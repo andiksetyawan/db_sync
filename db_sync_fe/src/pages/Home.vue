@@ -1,14 +1,5 @@
 <template>
   <div class="container mx-auto px-4 py-8 max-w-7xl">
-    <div class="mb-8">
-      <h1 class="text-4xl font-bold text-base-content mb-2">
-        🔄 Database Sync Scheduler
-      </h1>
-      <p class="text-base-content/70">
-        Monitor and control your database synchronization service with FK-aware ordering
-      </p>
-    </div>
-
     <div class="card bg-base-100 shadow-xl mb-6">
       <div class="card-body">
         <h2 class="card-title text-2xl mb-4">Control Panel</h2>
