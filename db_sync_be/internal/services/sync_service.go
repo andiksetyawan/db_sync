@@ -478,8 +478,9 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	}
 	concatExpr := strings.Join(concatColumns, ", ")
 
-	// Get all records from master with their checksums
-	masterQuery := fmt.Sprintf("SELECT *, CRC32(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
+	// Get all master data with checksums
+	masterQuery := fmt.Sprintf(
+		"SELECT *, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
 		concatExpr, tableName, pkColumn)
 
 	masterRows, err := s.masterDB.QueryContext(ctx, masterQuery)
@@ -493,13 +494,15 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 		return nil, fmt.Errorf("failed to scan master rows: %w", err)
 	}
 
-	// Get all records from backup with their checksums
-	backupQuery := fmt.Sprintf("SELECT *, CRC32(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
-		concatExpr, tableName, pkColumn)
+	backupQuery := fmt.Sprintf(
+		"SELECT `%s`, MD5(CONCAT_WS('|', %s)) as row_checksum FROM `%s` ORDER BY `%s`",
+		pkColumn, concatExpr, tableName, pkColumn)
 
 	backupRows, err := s.backupDB.QueryContext(ctx, backupQuery)
 	if err != nil {
+		// Jika tabel backup belum ada, return semua data master
 		if strings.Contains(err.Error(), "doesn't exist") {
+			// Remove checksum column from master data
 			for i := range masterData {
 				delete(masterData[i], "row_checksum")
 			}
@@ -509,18 +512,26 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 	}
 	defer backupRows.Close()
 
-	backupData, err := s.scanRowsToMaps(backupRows)
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan backup rows: %w", err)
-	}
+	// Step 3: Build backup checksum map
+	backupChecksums := make(map[string]string)
+	for backupRows.Next() {
+		var pkValue interface{}
+		var checksum string
 
-	backupChecksums := make(map[interface{}]interface{})
-	for _, row := range backupData {
-		if pkValue, exists := row[pkColumn]; exists {
-			if checksum, exists := row["row_checksum"]; exists {
-				backupChecksums[pkValue] = checksum
-			}
+		// Scan PK and checksum
+		err := backupRows.Scan(&pkValue, &checksum)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan backup checksum: %w", err)
 		}
+
+		// Convert pkValue to string for map key
+		var pkStr string
+		if b, ok := pkValue.([]byte); ok {
+			pkStr = string(b)
+		} else {
+			pkStr = fmt.Sprintf("%v", pkValue)
+		}
+		backupChecksums[pkStr] = checksum
 	}
 
 	var changedRows []map[string]interface{}
@@ -535,9 +546,18 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 			continue
 		}
 
-		backupChecksum, exists := backupChecksums[pkValue]
+		// Convert pkValue to string for map lookup
+		var pkStr string
+		if b, ok := pkValue.([]byte); ok {
+			pkStr = string(b)
+		} else {
+			pkStr = fmt.Sprintf("%v", pkValue)
+		}
 
-		if !exists || backupChecksum != masterChecksum {
+		backupChecksum, exists := backupChecksums[pkStr]
+
+		// If row doesn't exist in backup OR checksums are different
+		if !exists || masterChecksum != backupChecksum {
 			rowCopy := make(map[string]interface{})
 			for k, v := range masterRow {
 				if k != "row_checksum" {
@@ -547,7 +567,6 @@ func (s *SyncService) fetchChangedDataByChecksum(tableName, pkColumn string) ([]
 			changedRows = append(changedRows, rowCopy)
 		}
 	}
-
 	return changedRows, nil
 }
 
